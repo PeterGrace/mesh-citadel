@@ -208,6 +208,11 @@ class ContactManager:
     # MeshCore helpers
     # ------------------------------------------------------------------
 
+    def _is_chat_node(self, advert_data: dict) -> bool:
+        """Determine if this is a chat node (companion) we want to track."""
+        node_type = advert_data.get('type', 0)
+        return node_type == 1
+
     async def _get_device_contact_keys(self) -> List[str]:
         event = await self.meshcore.commands.get_contacts()
         if event.type == EventType.ERROR:
@@ -550,3 +555,51 @@ class ContactManager:
 
         return expiration_candidate_id
 
+    # TODO: update this to work with the new code
+    async def handle_advert(self, event):
+        """Handle incoming advertisement - only store chat nodes."""
+        try:
+            advert_data = event.payload
+
+            public_key = advert_data.get('public_key', '')
+            if not public_key:
+                log.warning("Advert missing public key")
+                return
+
+            node_id = public_key[:16]
+
+            # Query meshcore device for full contact details
+            if event.type == EventType.NEW_CONTACT:
+                contact_details = advert_data
+            else:
+                contact_details = await self._get_device_contact(public_key)
+            if not contact_details:
+                log.warning(f"Unable to add {node_id}: could not retrieve contact details")
+                return
+
+            if not self._is_chat_node(contact_details):
+                log.debug(f"Rejecting non-chat node: {contact_details}")
+                return  # Not a chat node, ignore
+
+            name = contact_details.get(
+                'adv_name', contact_details.get('name', 'Unknown'))
+
+            await self.ingest_contact(
+                node_id=node_id,
+                public_key=public_key,
+                name=contact_details.get("adv_name"),
+                node_type=contact_details.get("type", 1),
+                latitude=contact_details.get("adv_lat", 0.0),
+                longitude=contact_details.get("adv_lon", 0.0),
+                raw_advert_data=advert_data,
+            )
+
+            now = datetime.now(UTC)
+            last_seen = contact_details.get("last_seen", now)
+
+            # add_node will expire an old contact if necessary
+            await self.add_node(node_id)
+
+            log.info(f"Recorded advert: {name} ({node_id})")
+        except Exception as e:
+            log.exception(f"Unhandled exception in handle_advert: {e}")
