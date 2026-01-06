@@ -127,6 +127,9 @@ class GoNextUnreadCommand(BaseCommand):
         # Check if we wrapped to Lobby due to no unread rooms
         if new_room.room_id == SystemRoomIDs.LOBBY_ID and room.room_id != SystemRoomIDs.LOBBY_ID:
             # Check if there are any unread messages in the system
+
+            # TODO: this only checks if *lobby* has new messages, not
+            # all rooms in the system. update to check every room.
             lobby_has_unread = await new_room.has_unread_messages(user)
             if lobby_has_unread:
                 return ToUser(

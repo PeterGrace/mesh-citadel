@@ -188,13 +188,11 @@ class ContactManager:
             await self._delete_contact_from_node(oldest_public_key)
 
     async def get_contact(self, node_id: str, from_node=False) -> ContactInfo:
-        # retrieve the contact from the database, or optionally from
-        # the node memory (which takes much longer).  node_id needs at
-        # least the first 16 characters of the public_key, but can also be
-        # a full public_key.
-        # TODO: this is required for the event handler to work
+        """Retrieve a ContactInfo object, either from the database by
+        default, or from the node if from_node is set to True."""
+        log.info(f"Getting contact for {node_id}")
         if from_node:
-            contact = await self._get_node_contact(node_id)
+            contact = self._get_node_contact(node_id)
         else:
             contact = await self._get_db_contact(node_id)
         return contact
@@ -220,6 +218,8 @@ class ContactManager:
                 contact = self._advert_to_contactinfo(advert_data)
             else:
                 contact = await self.get_contact(node_id)
+                if not contact:
+                    contact = await self.get_contact(node_id, from_node=True)
             if not contact:
                 log.warning(f"Unable to add {node_id}: couldn't get contact details")
                 return
@@ -351,13 +351,13 @@ class ContactManager:
             parsed_contacts[public_key[:16]] = contact
         return parsed_contacts
 
-    async def _get_node_contact(self, node_id: str) -> ContactInfo:
+    def _get_node_contact(self, node_id: str) -> ContactInfo:
         """Retrieve a specified contact from the node's contact list"""
-        result = await self.meshcore.get_contact_by_key_prefix(node_id)
-        if result.type == EventType.ERROR:
-            log.error(f"Unable to get {node_id} from node: {result.payload}")
+        result = self.meshcore.get_contact_by_key_prefix(node_id)
+        if not result:
+            log.error(f"Unable to retrieve contact from node (no data)")
             return
-        contact = self._advert_to_contactinfo(result.payload)
+        contact = self._advert_to_contactinfo(result)
         return contact
 
     async def _count_node_contacts(self) -> int:

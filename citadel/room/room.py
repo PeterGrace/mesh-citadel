@@ -463,9 +463,11 @@ class Room:
     @classmethod
     async def create(cls, db, config, name: str, description: str,
                      read_only: bool, permission_level: PermissionLevel,
-                     after_room_id: int) -> int:
+                     after_room_id: int, creator: str) -> int:
         """Create a new room, which will appear in the room order after the
-        room specified in after_room_id."""
+        room specified in after_room_id. permission_level indicates the
+        permission level required to access the room after it's
+        created."""
         # Get next available room ID >= 100
         new_id = await cls._get_next_available_room_id(db)
 
@@ -495,8 +497,8 @@ class Room:
                              )
 
         await cls.initialize_room_order(db, config)
-        log.info(f"New room {name} created with ID {new_id}")
-        await cls.system_log(db, config, f"New room {name} created")
+        log.info(f"New room {name} created with ID {new_id} by {creator}")
+        await cls.system_log(db, config, f"New room {name} created by {creator}")
         return new_id
 
     async def delete_room(self, sys_user: str):

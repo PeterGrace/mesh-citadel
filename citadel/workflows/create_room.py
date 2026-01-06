@@ -88,7 +88,8 @@ class CreateRoomWorkflow(Workflow):
                 description="",  # no description for now
                 read_only=False,  # read-only can only be set in the edit flow
                 permission_level=PermissionLevel.USER,
-                after_room_id=current_room_id
+                after_room_id=current_room_id,
+                creator=session_state.username
             )
 
             context.session_mgr.set_current_room(context.session_id, new_id)
