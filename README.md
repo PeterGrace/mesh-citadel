@@ -158,7 +158,7 @@ the BBS.
 
 It'll spit out a bunch of logs, and you can call it with the `-d` flag
 to get a _lot_ more logs.  It sends an advert on startup, and you can't
-DM with it until it sees your advert, so you may have to advert before
+DM with it until it sees your advert, so you will have to advert before
 it'll respond.
 
 If you have it running locally, you can run the `cli_client.py` script
@@ -168,6 +168,13 @@ The first user to log in is automatically granted sysop powers, so
 be sure you log in (probably with the CLI client) _before_ you put it
 on the air.  If anything goes sideways, you can always delete the
 citadel.db file to start over.
+
+On the first few runs, when setting things up, I strongly recommend *not*
+running with the memory-based database (set `database -> use_memory` to
+`false` in your `config.yaml` file), to ensure that the setup changes
+are immediately written out to the persistent database.  Once everything
+seems to be working right, you can re-enable `use_memory`, which will
+noticeably speed up slower machines.
 
 Always keep in mind, this is _super duper ALPHA quality software._
 That means it's riddled with bugs and problems and missing features,
@@ -190,6 +197,9 @@ Raspberry Pi with an SD card, but it comes with important caveats.
    for it to completely terminate.  The DB shutdown (which saves what's
    in memory out to disk) is the last thing to run in the shutdown
    process.
+4. As mentioned above, when first setting up the BBS, registering the
+   sysop user, creating rooms, etc. don't use the memory database, simply
+   to ensure that your changes are saved immediately.
 
 If you're running the BBS on a system with a fast disk, I _highly_
 recommend not using the in-memory DB.  Likewise, if you have a big

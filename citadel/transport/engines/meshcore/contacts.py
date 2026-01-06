@@ -1,566 +1,214 @@
-"""
-ContactManager design overview
-------------------------------
+"""This module presents the ContactManager class, which performs the
+following public functions:
 
-We have two places where contacts live:
+    * Contact sync between node and DB
+    * Add/remove/retrieve contact info
 
-1. Node (MeshCore device) contact memory
-   - Small, fixed-size, fallible.
-   - If a contact is NOT on the node, the node cannot communicate with it.
-   - This is the *operational* source of truth.
+Internally, it exercises the following logic:
 
-2. Database (mc_chat_contacts)
-   - Persistent, reliable, in-memory SQLite.
-   - Stores contact metadata and raw advert data.
-   - Used to repopulate the node after faults or wipe.
+# Contact sync
 
-Authority is conditional:
+Calling the sync method causes the database and the node contact lists
+to become synchronized.  Specifically, the node will always be limited
+to the number of contacts allowed by the config.yaml file, while the
+database will not be size-limited.
 
-- If DB contact count <= node capacity:
-    DB is authoritative.
-    On sync, we push all DB contacts to the node (e.g. after node fault).
-    We do NOT delete DB rows in this mode.
+In cases where the node has more contacts than the database, the node's
+contact list will add to the database's list.  When the database has
+more contacts than the node, database contacts will be written to the node
+until its memory is at capacity.
 
-- If DB contact count > node capacity:
-    Node is authoritative.
-    On sync, we trim the DB to match the node's contacts.
-    DB rows whose node_id is not present on the node are deleted.
-    If the node has contacts that DB doesn't know about, we log a warning
-    and insert minimal rows for them.
+Although the node is the source of truth as far as which contacts may
+be used for communication, the database will usually hold a more
+complete list due to memory size constraints on the node.
 
-Expiration and capacity:
+# Add contact
 
-- Expiration is explicit capacity management:
-    - We choose an expiration_candidate contact to remove.
-    - We remove it from the node (by public_key).
-    - If the removal succeeds, we delete the corresponding DB row.
-    - If removal fails (hardware error), we DO NOT delete the DB row.
+Adding a contact will add or update a contact in the database.  It will
+also search for, remove, and re-add an existing contact on the node, or
+if the contact's public_key doesn't exist in the node, will remove the
+oldest contact on the node and add the new one.  Optionally, if the
+MeshCore library offers this functionality, the contact's details will
+be updated rather than the remove/re-add process.
 
-- We NEVER delete DB rows because of node add/remove *errors*.
-  Database loss must not be caused by hardware faults.
+# Delete contact
 
-Ingest path (from adverts):
+Deleting a contact will remove it from the node and from the database.
+This is unlikely to be used much in production, but makes sense to
+offer as part of an expected set of functions for a manager like this.
 
-- Node advertises a contact.
-- BBS receives raw advert data, parses node_id/public_key/name/etc.
-- BBS inserts/updates a row in mc_chat_contacts.
-- BBS attempts to ensure the contact is present on the node:
-    - If DB count <= capacity, we will eventually sync DB → node.
-    - If node is full when adding a new contact, we expire one contact first.
+# Expire contact
 
-Caching and performance:
+Expiring a contact will not take an argument like a public_key or name
+(that's what the remove contact method is for), it will simply go into
+the list of node contacts and remove the oldest one, usually in order
+to make space.  Expiring a contact does NOT remove it from the
+database.
 
-- Node I/O is expensive; DB access is cheap (SQLite in-memory).
-- We maintain a small in-memory cache: node_id → (public_key, last_seen, name)
-- We DO NOT load the entire DB into memory.
-- Cache is always kept in sync with DB writes.
+# Retrieve contact
+
+This will retrieve information from the database (or optionally from
+the node, if the correct flag is passed), and return it in ContactInfo
+format.
 """
 
-import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Any, List
+import json
+import logging
 
-from meshcore import EventType  # adjust import as needed
+from meshcore import EventType
 
 log = logging.getLogger(__name__)
 UTC = timezone.utc
 
+@dataclass
+class ContactInfo:
+    node_id: str
+    public_key: str
+    name: str = ""
+    node_type: int = 1
+    latitude: float = 0.0
+    longitude: float = 0.0
+    first_seen: datetime = None
+    last_seen: datetime = None
+    raw_advert_data: str = ""
+
+    def __post_init__(self):
+        if not self.first_seen:
+            self.first_seen = datetime.now(UTC)
+        if not self.last_seen:
+            self.last_seen = datetime.now(UTC)
+
+
+@dataclass
+class CacheEntry:
+    name: str
+    public_key: str
+    last_seen: datetime
+
+
 class ContactManager:
-    def __init__(self, meshcore, db, config) -> None:
+    def __init__(self, meshcore, db, config):
         self.db = db
         self.meshcore = meshcore
-        self.config = config.transport.get(
-            "meshcore", {}).get("contact_manager", {})
+        self.config = config.transport.get("meshcore",
+                                           {}).get("contact_manager", {})
+        # node_id -> CacheEntry
+        self._db_cache = {}
+        self._node_cache = {}
+        self._running = False
 
-        # Minimal cache: node_id → (public_key, last_seen, name)
-        self._cache: Dict[str, tuple] = {}
+    async def start(self):
+        """Start the ContactManager service. This includes performing a
+        synchronization, if the 'update_contacts' field is set to true
+        in config.yaml."""
+        if self._running:
+            return
 
-    # ------------------------------------------------------------------
-    # Capacity helper
-    # ------------------------------------------------------------------
+        if self.meshcore:
+            result = await self.meshcore.commands.set_manual_add_contacts(True)
+            if result.type == EventType.ERROR:
+                log.warning(f"Unable to disable auto-add of contacts: {result.payload}")
+            else:
+                log.info("Disabled auto-add of contacts on node")
+
+        if self.config.get("update_contacts", False):
+            self.synchronize()
+
+        log.info("Initializing contact caches")
+        await self._load_db_cache()
+        await self._load_node_cache()
+        log.info("ContactManager startup complete")
+        self._running = True
+
+    #------------------------------------------------------------
+    # Properties
+    #------------------------------------------------------------
 
     @property
-    def effective_capacity(self) -> int:
+    def max_node_contacts(self):
         max_contacts = self.config.get("max_device_contacts", 100)
         buffer = self.config.get("contact_limit_buffer", 0)
         return max_contacts - buffer
 
-    # ------------------------------------------------------------------
-    # DB helpers
-    # ------------------------------------------------------------------
+    #------------------------------------------------------------
+    # Public sync methods
+    #------------------------------------------------------------
 
-    async def _count_contacts_in_db(self) -> int:
-        rows = await self.db.execute("SELECT COUNT(*) FROM mc_chat_contacts")
-        if rows:
-            return int(rows[0][0])
-        return 0
+    async def synchronize(self):
+        """Copy contact list from node to db (if the node has more
+        contacts) or from db to node (if the db has more contacts).
+        Does not touch caches, which must be updated separately."""
+        node_contacts = await self._count_node_contacts()
+        db_contacts = await self._count_db_contacts()
 
-    async def _load_cache_from_db(self) -> None:
-        """
-        Load the entire DB into the minimal cache.
-        This is only done at initialization or sync.
-        """
-        rows = await self.db.execute(
-            """
-            SELECT node_id, public_key, last_seen, name
-            FROM mc_chat_contacts
-            """
-        )
-        rows = rows or []
-        self._cache.clear()
-        for node_id, public_key, last_seen, name in rows:
-            if last_seen is None:
-                last_seen = datetime.min.replace(tzinfo=UTC)
-            self._cache[node_id] = (public_key, last_seen, name)
+        if node_contacts <= db_contacts:
+            log.info("Synchronizing database contacts to node")
+            await self._sync_db_to_node()
+        elif db_contacts < node_contacts:
+            log.info("Synchronizing node contacts to database")
+            await self._sync_node_to_db()
 
-    async def _get_contact_row(self, node_id: str) -> Optional[tuple]:
-        rows = await self.db.execute(
-            """
-            SELECT node_id,
-                   public_key,
-                   name,
-                   node_type,
-                   latitude,
-                   longitude,
-                   first_seen,
-                   last_seen,
-                   raw_advert_data
-            FROM mc_chat_contacts
-            WHERE node_id = ?
-            """,
-            (node_id,),
-        )
-        rows = rows or []
-        return rows[0] if rows else None
+    #------------------------------------------------------------
+    # Public CRUD methods
+    #------------------------------------------------------------
 
-    async def _upsert_contact_row(
-        self,
-        node_id: str,
-        public_key: str,
-        name: Optional[str],
-        node_type: int,
-        latitude: Optional[float],
-        longitude: Optional[float],
-        first_seen: datetime,
-        last_seen: datetime,
-        raw_advert_data: str,
-    ) -> None:
-        await self.db.execute(
-            """
-            INSERT INTO mc_chat_contacts (
-                node_id,
-                public_key,
-                name,
-                node_type,
-                latitude,
-                longitude,
-                first_seen,
-                last_seen,
-                raw_advert_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(node_id) DO UPDATE SET
-                public_key = excluded.public_key,
-                name = excluded.name,
-                node_type = excluded.node_type,
-                latitude = excluded.latitude,
-                longitude = excluded.longitude,
-                last_seen = excluded.last_seen,
-                raw_advert_data = excluded.raw_advert_data
-            """,
-            (
-                node_id,
-                public_key,
-                name,
-                node_type,
-                latitude,
-                longitude,
-                first_seen,
-                last_seen,
-                raw_advert_data,
-            ),
-        )
+    async def add_contact(self, contact: ContactInfo):
+        """Add the specified contact to the database and the node's contact
+        list."""
+        node_contacts = await self._count_node_contacts()
 
-        # Update cache
-        self._cache[node_id] = (public_key, last_seen, name)
-
-    async def _delete_contact_row(self, node_id: str) -> None:
-        await self.db.execute(
-            "DELETE FROM mc_chat_contacts WHERE node_id = ?",
-            (node_id,),
-        )
-        self._cache.pop(node_id, None)
-
-    async def _iter_db_contacts_sorted_by_last_seen_desc(self) -> List[str]:
-        rows = await self.db.execute(
-            "SELECT node_id FROM mc_chat_contacts ORDER BY last_seen DESC"
-        )
-        rows = rows or []
-        return [row[0] for row in rows]
-
-    async def _iter_db_contacts_sorted_by_last_seen_asc(self) -> List[str]:
-        rows = await self.db.execute(
-            "SELECT node_id FROM mc_chat_contacts ORDER BY last_seen ASC"
-        )
-        rows = rows or []
-        return [row[0] for row in rows]
-
-    # ------------------------------------------------------------------
-    # MeshCore helpers
-    # ------------------------------------------------------------------
-
-    def _is_chat_node(self, advert_data: dict) -> bool:
-        """Determine if this is a chat node (companion) we want to track."""
-        node_type = advert_data.get('type', 0)
-        return node_type == 1
-
-    async def _get_device_contact_keys(self) -> List[str]:
-        event = await self.meshcore.commands.get_contacts()
-        if event.type == EventType.ERROR:
-            log.error("MeshCore get_contacts failed: %s", event.payload)
-            return []
-        payload = event.payload or []
-        if not isinstance(payload, list):
-            log.error("Unexpected get_contacts payload type: %r", type(payload))
-            return []
-        return payload
-
-    async def _get_device_contact(self, key_prefix: str) -> Optional[Dict[str, Any]]:
         try:
-            info = self.meshcore.get_contact_by_key_prefix(key_prefix)
-        except Exception:
-            log.exception("MeshCore get_device_contact failed for %s", key_prefix)
-            return None
-        if not isinstance(info, dict):
-            log.error("Unexpected contact info type for %s: %r", key_prefix, type(info))
-            return None
-        return info
+            if node_contacts >= self.max_node_contacts:
+                await self.expire_contact()
+            await self._add_contact_to_db(contact)
+            await self._add_contact_to_node(contact)
+        except Exception as err:
+            log.exception(f"Unable to add {contact.name}: {err}")
 
-    async def _add_contact_to_device(self, raw_advert_data: str) -> bool:
-        event = await self.meshcore.commands.add_contact(raw_advert_data)
-        if event.type == EventType.ERROR:
-            log.error("MeshCore add_contact failed: %s", event.payload)
-            return False
-        log.debug("Added contact to device: {raw_advert_data}")
-        return True
+    async def delete_contact(self, contact: ContactInfo):
+        """Remove the named contact from both node and database contact
+        lists"""
+        await self._delete_contact_from_node(contact)
+        await self._delete_contact_from_db(contact)
+        log.info(f"Deleted {contact.name} ({contact.node_id}) from db and node")
 
-    async def _remove_contact_from_device(self, public_key: str) -> bool:
-        event = await self.meshcore.commands.remove_contact(public_key)
-        if event.type == EventType.ERROR:
-            log.error("MeshCore remove_contact failed for %s: %s", public_key, event.payload)
-            return False
-        log.debug("Removed contact from device: {public_key[:16]}")
-        return True
+    async def expire_contact(self):
+        """Remove the oldest contact from the node's contact list,
+        without modifying the contents of the database's contact
+        list."""
+        oldest = 0
+        oldest_public_key = ""
+        for entry in self._node_cache.values():
+            if oldest == 0 or entry.last_seen < oldest:
+                oldest = entry.last_seen
+                oldest_public_key = entry.public_key
+        if oldest_public_key:
+            await self._delete_contact_from_node(oldest_public_key)
 
-    # ------------------------------------------------------------------
-    # Initialization / sync
-    # ------------------------------------------------------------------
-
-    async def start(self) -> None:
-        """
-        Reconcile DB and node according to conditional authority.
-        """
-        if self.meshcore:
-            result = await self.meshcore.commands.set_manual_add_contacts(True)
-            if result.type == EventType.ERROR:
-                log.warning(
-                    f"Unable to disable auto-add of contacts: {result.payload}")
-            else:
-                log.info("Disabled meshcore auto-add of contacts")
-
-        await self._load_cache_from_db()
-
-        db_count = await self._count_contacts_in_db()
-        capacity = self.effective_capacity
-        device_keys = await self._get_device_contact_keys()
-
-        log.info(
-            "ContactManager started. Contact counts: DB=%d, node=%d, capacity=%d",
-            db_count,
-            len(device_keys),
-            capacity,
-        )
-
-        if self.config.get("update_contacts", False):
-            if db_count <= capacity:
-                log.info("Synchronizing contacts from DB -> node")
-                await self._sync_db_as_authority()
-            else:
-                log.info("Synchronizing contacts from node -> DB")
-                await self._sync_node_as_authority(device_keys)
+    async def get_contact(self, node_id: str, from_node=False) -> ContactInfo:
+        # retrieve the contact from the database, or optionally from
+        # the node memory (which takes much longer).  node_id needs at
+        # least the first 16 characters of the public_key, but can also be
+        # a full public_key.
+        # TODO: this is required for the event handler to work
+        if from_node:
+            contact = await self._get_node_contact(node_id)
         else:
-            log.info("Contact update configured off, skipping")
+            contact = await self._get_db_contact(node_id)
+        return contact
 
-    async def _sync_db_as_authority(self) -> None:
-        """
-        DB is authoritative (DB count <= capacity).
-        Push all DB contacts to the node.
-        """
-        node_ids = await self._iter_db_contacts_sorted_by_last_seen_desc()
 
-        capacity = self.effective_capacity
-        contacts_loaded = 0
+    #------------------------------------------------------------
+    # Advert handler
+    #------------------------------------------------------------
 
-        for node_id in node_ids:
-            if contacts_loaded >= capacity:
-                log.info("Loaded {contacts_loaded} contacts into node")
-                break
-            row = await self._get_contact_row(node_id)
-            if not row:
-                log.warning("DB-authoritative sync: missing row for %s", node_id)
-                continue
-
-            (
-                _node_id,
-                public_key,
-                name,
-                node_type,
-                latitude,
-                longitude,
-                first_seen,
-                last_seen,
-                raw_advert_data,
-            ) = row
-
-            if not raw_advert_data:
-                log.warning("DB-authoritative sync: %s missing raw_advert_data", node_id)
-                continue
-
-            success = await self._add_contact_to_device(raw_advert_data)
-            if success:
-                contacts_loaded += 1
-            else:
-                log.error(
-                    "DB-authoritative sync: failed to add %s to node; DB preserved",
-                    node_id,
-                )
-
-    async def _sync_node_as_authority(self, device_keys: List[str]) -> None:
-        """
-        Node is authoritative (DB count > capacity).
-        Trim DB to match node.
-        """
-        device_node_ids: Dict[str, str] = {}
-
-        # Build device node_id → public_key map
-        for key_prefix in device_keys:
-            info = await self._get_device_contact(key_prefix)
-            if not info:
-                continue
-
-            node_id = key_prefix[:16]
-            public_key = info.get("public_key")
-            if not public_key:
-                log.warning("Node-authoritative sync: %s missing public_key", key_prefix)
-                continue
-
-            device_node_ids[node_id] = public_key
-
-            # If DB doesn't know this contact, insert minimal row
-            if node_id not in self._cache:
-                log.warning(
-                    "Node-authoritative sync: device contact %s not in DB; inserting minimal",
-                    node_id,
-                )
-                now = datetime.now(UTC)
-                await self._upsert_contact_row(
-                    node_id=node_id,
-                    public_key=public_key,
-                    name=info.get("adv_name"),
-                    node_type=info.get("type", 1),
-                    latitude=info.get("adv_lat", 0.0),
-                    longitude=info.get("adv_lon", 0.0),
-                    first_seen=now,
-                    last_seen=now,
-                    raw_advert_data="",
-                )
-
-        # Delete DB rows not present on device
-        rows = await self.db.execute("SELECT node_id FROM mc_chat_contacts")
-        rows = rows or []
-        for (node_id,) in rows:
-            if node_id not in device_node_ids:
-                log.info(
-                    "Node-authoritative sync: deleting DB contact %s (not on device)",
-                    node_id,
-                )
-                await self._delete_contact_row(node_id)
-
-        # Rebuild cache
-        await self._load_cache_from_db()
-
-    # ------------------------------------------------------------------
-    # Ingest path
-    # ------------------------------------------------------------------
-
-    async def ingest_contact(
-        self,
-        node_id: str,
-        public_key: str,
-        name: Optional[str],
-        node_type: int,
-        latitude: Optional[float],
-        longitude: Optional[float],
-        raw_advert_data: str,
-    ) -> None:
-        now = datetime.now(UTC)
-
-        existing = await self._get_contact_row(node_id)
-        if existing:
-            first_seen = existing[6]
-        else:
-            first_seen = now
-
-        await self._upsert_contact_row(
-            node_id=node_id,
-            public_key=public_key,
-            name=name,
-            node_type=node_type,
-            latitude=latitude,
-            longitude=longitude,
-            first_seen=first_seen,
-            last_seen=now,
-            raw_advert_data=raw_advert_data,
-        )
-
-    # ------------------------------------------------------------------
-    # Explicit add / delete
-    # ------------------------------------------------------------------
-
-    async def add_node(
-        self,
-        node_id: str,
-        public_key: str,
-        name: Optional[str],
-        node_type: int,
-        latitude: Optional[float],
-        longitude: Optional[float],
-        raw_advert_data: str,
-    ) -> bool:
-        """Add a node to the database and the node's contact memory.
-        Returns True on success, or False if anything went wrong."""
-        now = datetime.now(UTC)
-
-        existing = await self._get_contact_row(node_id)
-        if existing:
-            first_seen = existing[6]
-        else:
-            first_seen = now
-
-        await self._upsert_contact_row(
-            node_id=node_id,
-            public_key=public_key,
-            name=name,
-            node_type=node_type,
-            latitude=latitude,
-            longitude=longitude,
-            first_seen=first_seen,
-            last_seen=now,
-            raw_advert_data=raw_advert_data,
-        )
-
-        db_count = await self._count_contacts_in_db()
-        capacity = self.effective_capacity
-
-        # TODO: this feels wrong: rather than blindly removing an old
-        # contact from the node, we should be intelligently filling the
-        # node to capacity, then stopping the load process, based on
-        # the most recent {capacity} number of contacts.
-        if db_count > capacity:
-            await self._expire_one_contact()
-
-        success = await self._add_contact_to_device(raw_advert_data)
-        if not success:
-            log.error("add_node: failed to add %s to node; DB preserved", node_id)
-            return False
-
-        return True
-
-    async def delete_node(self, node_id: str) -> bool:
-        """Remove the specified node from both the node and the
-        database."""
-        row = await self._get_contact_row(node_id)
-        public_key = row[1] if row else None
-
-        if not public_key:
-            info = await self._get_device_contact(node_id)
-            if info and "public_key" in info:
-                public_key = info["public_key"]
-
-        if public_key:
-            success = await self._remove_contact_from_device(public_key)
-            if not success:
-                log.warning(
-                    "delete_node: unable to remove contact for %s from device",
-                    node_id,
-                )
-        else:
-            log.warning("delete_node: no public_key found for %s; cannot remove from device", node_id)
-
-        await self._delete_contact_row(node_id)
-        return True
-
-    # ------------------------------------------------------------------
-    # Expiration logic
-    # ------------------------------------------------------------------
-
-    async def _expire_one_contact(self) -> Optional[str]:
-        """
-        Choose one contact in DB as an expiration_candidate and remove it
-        from both node and DB.
-
-        Strategy:
-        - Use DB last_seen ascending to pick the oldest contact.
-        - Use its public_key to remove from device.
-        - If device removal fails, log and DO NOT delete from DB.
-        """
-        node_ids = await self._iter_db_contacts_sorted_by_last_seen_asc()
-        if not node_ids:
-            return None
-
-        expiration_candidate_id = node_ids[0]
-        row = await self._get_contact_row(expiration_candidate_id)
-        if not row:
-            log.warning(
-                "Expiration: candidate %s vanished from DB; skipping",
-                expiration_candidate_id,
-            )
-            return None
-
-        (
-            _node_id,
-            public_key,
-            _name,
-            _ntype,
-            _lat,
-            _lon,
-            _first_seen,
-            _last_seen,
-            _raw,
-        ) = row
-
-        # Remove from device first.
-        success = await self._remove_contact_from_device(public_key)
-        if not success:
-            # Node is misbehaving; do NOT delete DB row.
-            log.error(
-                "Expiration: failed to remove contact %s from device; DB preserved",
-                expiration_candidate_id,
-            )
-            return None
-
-        # Now safe to delete from DB.
-        await self._delete_contact_row(expiration_candidate_id)
-        log.info("Expiration: removed contact %s from both node and DB",
-                 expiration_candidate_id)
-
-        return expiration_candidate_id
-
-    # TODO: update this to work with the new code
     async def handle_advert(self, event):
-        """Handle incoming advertisement - only store chat nodes."""
+        """Upon reception of a new advert from MeshCore, add the new
+        contact to our system if it's a companion node."""
         try:
             advert_data = event.payload
-
             public_key = advert_data.get('public_key', '')
             if not public_key:
                 log.warning("Advert missing public key")
@@ -568,38 +216,296 @@ class ContactManager:
 
             node_id = public_key[:16]
 
-            # Query meshcore device for full contact details
             if event.type == EventType.NEW_CONTACT:
-                contact_details = advert_data
+                contact = self._advert_to_contactinfo(advert_data)
             else:
-                contact_details = await self._get_device_contact(public_key)
-            if not contact_details:
-                log.warning(f"Unable to add {node_id}: could not retrieve contact details")
+                contact = await self.get_contact(node_id)
+            if not contact:
+                log.warning(f"Unable to add {node_id}: couldn't get contact details")
+                return
+            
+            if not self._is_companion(contact): 
+                log.debug(f"Discarding non-companion advert: {contact}")
                 return
 
-            if not self._is_chat_node(contact_details):
-                log.debug(f"Rejecting non-chat node: {contact_details}")
-                return  # Not a chat node, ignore
+            await self.add_contact(contact)
+            log.info(f"Recorded advert: {contact.name} ({node_id})")
+        except Exception as err:
+            log.exception(f"Unable to process new advert: {err}")
 
-            name = contact_details.get(
-                'adv_name', contact_details.get('name', 'Unknown'))
+    #------------------------------------------------------------
+    # Contact helpers
+    #------------------------------------------------------------
 
-            await self.ingest_contact(
-                node_id=node_id,
-                public_key=public_key,
-                name=contact_details.get("adv_name"),
-                node_type=contact_details.get("type", 1),
-                latitude=contact_details.get("adv_lat", 0.0),
-                longitude=contact_details.get("adv_lon", 0.0),
-                raw_advert_data=advert_data,
+    def _advert_to_contactinfo(self, advert) -> ContactInfo:
+        """Convert the data from an advert into a ContactInfo object. Takes
+        either a JSON string or a dict as advert."""
+        if isinstance(advert, str):
+            try:
+                str_advert = advert
+                advert = json.loads(advert)
+            except json.JSONDecodeError as err:
+                log.exception(f"Unable to convert {str_advert} to dict: {err}")
+                return
+        else:
+            str_advert = json.dumps(advert)
+
+        try:
+            contact = ContactInfo(
+                node_id=advert['public_key'][:16],
+                public_key=advert['public_key'],
+                node_type=int(advert['type']),
+                name=advert['adv_name'],
+                latitude=float(advert.get("adv_lat", 0.0)),
+                longitude=float(advert.get("adv_lon", 0.0)),
+                raw_advert_data=str_advert,
             )
+        except Exception as err:
+            log.exception(f"Unable to convert {advert} to ContactInfo: {err}")
+            return
+        return contact
 
-            now = datetime.now(UTC)
-            last_seen = contact_details.get("last_seen", now)
+    def _contactinfo_to_advert(self, contact) -> dict:
+        """Convert a ContactInfo struct into an advert dictionary"""
+        advert = {}
+        advert['public_key'] = contact.public_key
+        advert['type'] = int(contact.node_type)
+        advert['flags'] = 0
+        advert['out_path_len'] = 0
+        advert['out_path'] = ''
+        advert['adv_name'] = contact.name
+        if isinstance(contact.last_seen, str):
+            contact.last_seen = datetime.fromisoformat(contact.last_seen)
+        advert['last_advert'] = int(contact.last_seen.strftime('%s'))
+        advert['adv_lat'] = contact.latitude
+        advert['adv_lon'] = contact.longitude
+        advert['lastmod'] = advert['last_advert']
+        return advert
 
-            # add_node will expire an old contact if necessary
-            await self.add_node(node_id)
+    def _is_companion(self, contact) -> bool:
+        return contact.node_type == 1
 
-            log.info(f"Recorded advert: {name} ({node_id})")
-        except Exception as e:
-            log.exception(f"Unhandled exception in handle_advert: {e}")
+    def _make_cache_entry(self, contact) -> CacheEntry:
+        return CacheEntry(
+            name=contact.name,
+            public_key=contact.public_key,
+            last_seen=contact.last_seen
+        )
+
+
+    #------------------------------------------------------------
+    # Synchronization helpers
+    #------------------------------------------------------------
+
+    async def _sync_db_to_node(self):
+        """Synchronize the contacts which are currently in the
+        database, up to the node's memory limit, into the node's
+        contact list."""
+        capacity = self.max_node_contacts
+        query = """
+            SELECT node_id, raw_advert_data
+            FROM mc_chat_contacts
+            ORDERED BY last_seen DESC
+        """
+        data = await self.db.execute(query)
+        count = 0
+        for node_id, raw_advert_data in data:
+            if count <= capacity:
+                contact = self._advert_to_contactinfo(raw_advert_data)
+                result = await self._add_contact_to_node(contact)
+                if result:
+                    count += 1
+        log.info(f"Synced {count} contacts from database to node")
+
+    async def _sync_node_to_db(self):
+        """Synchronize the contacts which are currently on the node
+        into the database. Usually, this will occur when the BBS is
+        newly installed, but the node already has some contacts
+        available."""
+        contacts = self._get_all_node_contacts
+        count = 0
+        for node_id, contact in contacts.items():
+            await self._add_contact_to_db(contact)
+            count += 1
+        log.info(f"Synced {count} contacts from node to database")
+
+    #------------------------------------------------------------
+    # Node/MeshCore helpers
+    #------------------------------------------------------------
+
+    async def _load_node_cache(self):
+        """Reload the node cache with the current contends of the node's
+        contact list"""
+        all_contacts = await self._get_all_node_contacts()
+        self._node_cache = {}
+        for node_id, contact in all_contacts.items():
+            self._node_cache[node_id] = self._make_cache_entry(contact)
+
+    async def _get_all_node_contacts(self):
+        """Return a dict of all node contacts, of the form {node_id:
+        contact_info}"""
+        node_contacts = await self.meshcore.commands.get_contacts()
+        parsed_contacts = {}
+        for public_key, data in node_contacts.payload.items():
+            contact = self._advert_to_contactinfo(data)
+            parsed_contacts[public_key[:16]] = contact
+        return parsed_contacts
+
+    async def _get_node_contact(self, node_id: str) -> ContactInfo:
+        """Retrieve a specified contact from the node's contact list"""
+        result = await self.meshcore.get_contact_by_key_prefix(node_id)
+        if result.type == EventType.ERROR:
+            log.error(f"Unable to get {node_id} from node: {result.payload}")
+            return
+        contact = self._advert_to_contactinfo(result.payload)
+        return contact
+
+    async def _count_node_contacts(self) -> int:
+        """Get a count of the number of contacts currently in the
+        node's contact list. This is a relatively time-consuming
+        call."""
+        result = await self.meshcore.commands.get_contacts()
+        if result.type == EventType.ERROR:
+            log.error(f"Unable to count node contacts: {result.payload}")
+        return len(result.payload)
+
+    async def _add_contact_to_node(self, contact: ContactInfo) -> bool:
+        """Blindly add the given contact to the node, and the node
+        cache.  This function *does not* handle making space for a new
+        contact."""
+        if contact.raw_advert_data:
+            try:
+                advert = json.loads(contact.raw_advert_data)
+            except (json.JSONDecodeError, TypeError):
+                advert = self._contactinfo_to_advert(contact)
+            result = await self.meshcore.commands.add_contact(advert)
+        else:
+            log.error(f"Unable to add {contact.name} to node contact list: missing advert string")
+            return False
+        if result.type == EventType.ERROR:
+            log.error(f"Unable to add {contact.name} to node contact list: {result.payload}")
+            return False
+        self._node_cache[contact.node_id] = self._make_cache_entry(contact)
+        return True
+
+    async def _delete_contact_from_node(self, identifier):
+        """Blindly delete the given contact from the node.  This
+        function is only intended to operate on a specific contact."""
+        if isinstance(identifier, ContactInfo):
+            public_key = identifier.public_key
+        elif isinstance(identifier, str):
+            public_key = identifier
+        else:
+            log.error(f"Malformed data passed to _delete_contact_from_node: {identifier}")
+            return False
+
+        result = await self.meshcore.commands.remove_contact(public_key)
+        if result.type == EventType.ERROR:
+            log.error(f"Unable to remove {public_key} from node: {result.payload}")
+            return False
+        return True
+
+    #------------------------------------------------------------
+    # Database helpers
+    #------------------------------------------------------------
+
+    async def _load_db_cache(self):
+        """Reload the cache with the current contents of the
+        database"""
+        query = "SELECT node_id, name, public_key, last_seen FROM mc_chat_contacts"
+        contacts = await self.db.execute(query)
+
+        self._cache = {}
+        for row in contacts:
+            node_id, name, public_key, last_seen = row
+            contact = ContactInfo(node_id=node_id,
+                                  public_key=public_key, name=name,
+                                  last_seen=last_seen)
+            self._db_cache[node_id] = self._make_cache_entry(contact)
+
+    async def _get_db_contact(self, node_id: str) -> ContactInfo:
+        """Retrieve a single contact record from the database."""
+        query = "SELECT * FROM mc_chat_contacts WHERE node_id = ?"
+        try:
+            result = await self.db.execute(query, (node_id,))
+        except RuntimeError as err:
+            log.error(f"Unable to get {node_id} from database: {err}")
+            return
+        if not result or not isinstance(result, list):
+            log.error(f"Unable to get {node_id} from database: No data")
+            return
+
+        data = result[0]
+        contact = ContactInfo(
+            node_id=data[0],
+            public_key=data[1],
+            name=data[2],
+            node_type=data[3],
+            latitude=data[4],
+            longitude=data[5],
+            first_seen=data[6],
+            last_seen=data[7],
+            raw_advert_data=data[8],
+        )
+        return contact
+
+    async def _count_db_contacts(self):
+        """Get a count of the number of contacts stored in the
+        database."""
+        query = "SELECT COUNT(*) FROM mc_chat_contacts"
+        count = await self.db.execute(query)
+        if count:
+            return count[0][0]
+        return 0
+
+    async def _add_contact_to_db(self, contact: ContactInfo):
+        """Add contact to the database contact list, updating the cache
+        in the process."""
+        query = """
+            INSERT INTO mc_chat_contacts (
+                node_id,  
+                public_key,
+                name,
+                node_type,
+                latitude,             
+                longitude,
+                first_seen,
+                last_seen,
+                raw_advert_data
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET   
+                public_key = excluded.public_key,
+                name = excluded.name,
+                node_type = excluded.node_type,
+                latitude = excluded.latitude,
+                longitude = excluded.longitude,
+                last_seen = excluded.last_seen,
+                raw_advert_data = excluded.raw_advert_data
+        """
+        try:
+            await self.db.execute(query, (
+                contact.node_id,
+                contact.public_key,
+                contact.name,
+                contact.node_type,
+                contact.latitude,
+                contact.longitude,
+                contact.first_seen,
+                contact.last_seen,
+                contact.raw_advert_data
+                )
+            )
+        except RuntimeError as err:
+            log.exception(f"Unable to add contact to database: {err}")
+            return
+        self._db_cache[contact.node_id] = self._make_cache_entry(contact)
+
+    async def _delete_contact_from_db(self, contact: ContactInfo):
+        """Remove the specified contact from the database"""
+        query = "DELETE FROM mc_chat_contacts WHERE node_id = ?"
+        try:
+            await self.db.execute(query, contact.node_id)
+        except RuntimeError as err:
+            log.error("Unable to delete contact from database: {contact}")
+            log.exception(err)
+        del self._db_cache[node_id]

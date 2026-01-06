@@ -178,7 +178,14 @@ class MeshCoreTransportEngine:
         debug = False
         if log.getEffectiveLevel() <= logging.DEBUG:
             debug = True
-        mc = await MeshCore.create_serial(serial_port, baud_rate, debug=debug)
+        try:
+            mc = await MeshCore.create_serial(serial_port,
+                                              baud_rate,
+                                              debug=debug)
+        except SerialException as err:
+            log.error(f"Unable to connect to MeshCore node hardware: {err}")
+            log.error(f"Giving up on MeshCore connection")
+            return
 
         # Set node time
         now = int(time.time())
@@ -187,7 +194,8 @@ class MeshCoreTransportEngine:
         from citadel.transport.manager import TransportError
         if result.type == EventType.ERROR:
             log.warning(f"Unable to sync time: {result.payload}")
-            log.warning("Consider rebooting node (non-critical)")
+            log.warning("Node may not be communicating correctly")
+            log.warning("Ensure node has USB companion firmware loaded")
 
         # Configure radio parameters
         log.info(f"Setting MeshCore frequency to {frequency} MHz")
