@@ -1,3 +1,16 @@
+## 0.12.0 (2026-01-06)
+
+### Fix
+
+- the new contacts module is now working correctly for main code pathways, calling it good for now.  also tweaked the room creation process to log the creator.  renamed a number of files to be clearer in their intent
+- bumping version
+- **contact-registration**: the new contacts rewrite is now functional with a running BBS process, though it's not fully tested yet.  the code makes a lot more sense now, and is much easier to understand than the functional but ugly AI spaghetti slop that was there before
+- **contact-registration**: snapshot, now including a partial from-scratch rewrite of the contacts code, but this time with zero use of AI to clutter things up
+- **contact-registration-system**: progress snapshot: new contacts.py code in place, but incomplete
+- **contact-management-system**: in-progress snapshot of code changes to contact management system, in an attempt to make the system easier to understand and fix numerous bugs related to reaching the limit of contacts on the node hardware
+- **user-registration**: updated user registration and validation system to properly log to the System room
+- **CLI-client**: cleaned up poor connection handling which was leading to hangs on shutdown if a CLI client had connected
+
 ## 0.10.1 (2025-11-30)
 
 ### Fix
