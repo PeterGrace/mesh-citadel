@@ -1,4 +1,4 @@
-## 0.12.0 (2026-01-06)
+## 0.11.0 (2026-01-06)
 
 ### Fix
 
@@ -23,7 +23,6 @@
 ### Feat
 
 - **user-edit**: modified user edit workflow to only allow an aide to promote someone else to aide, not sysop
-- **user-management**: started writing a workflow for an edit user command
 
 ### Fix
 
@@ -58,6 +57,7 @@
 ### Feat
 
 - **meshcore-engine**: found a bug in message entry which is causing disconnects.  tracking it down now
+- **user-management**: started writing a workflow for an edit user command
 
 ### Fix
 
