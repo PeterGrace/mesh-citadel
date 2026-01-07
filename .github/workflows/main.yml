@@ -1,0 +1,21 @@
+name: PR
+
+on:
+  pull_request:
+  push:
+    branch: main
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+      - name: dependencies
+        run: pip install -r requirements.txt
+      - name: test
+        run: python -m unittest discover tests/
+
