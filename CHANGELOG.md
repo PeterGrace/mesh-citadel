@@ -1,3 +1,9 @@
+## 0.11.1 (2026-01-07)
+
+### Fix
+
+- Adding main.py for the meshcore engine.  This was a name change that got missed in the last checkin
+
 ## 0.11.0 (2026-01-06)
 
 ### Fix
